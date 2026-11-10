@@ -1,34 +1,195 @@
 package com.chat.server;
 
 import com.chat.db.Database;
+import com.formdev.flatlaf.FlatDarkLaf;
+
+import javax.swing.*;
+import javax.swing.border.EmptyBorder;
+import java.awt.*;
 import java.io.*;
 import java.net.*;
 import java.sql.*;
 import java.util.*;
 import java.util.concurrent.*;
 
-public class ChatServer {
+public class ChatServer extends JFrame {
     private static final int PORT = 12345;
     private static final Map<String, ClientHandler> onlineUsers = new ConcurrentHashMap<>();
 
-    public static void main(String[] args) {
+    private ServerSocket serverSocket;
+    private ExecutorService executor;
+    private boolean isRunning = false;
+
+    // Thành phần Giao diện GUI
+    private final JLabel lblStatus = new JLabel("Trạng thái: Đã dừng");
+    private final JTextArea txtLog = new JTextArea();
+    private final DefaultListModel<String> clientListModel = new DefaultListModel<>();
+    private final JList<String> lstClients = new JList<>(clientListModel);
+    private final JButton btnStartStop = new JButton("Khởi động Server");
+    private final JButton btnKick = new JButton("🚫 Kick Client");
+
+    public ChatServer() {
+        initUI();
         Database.initDatabase();
-        System.out.println("=== CHAT SERVER RUNNING ON PORT " + PORT + " (JAVA 23) ===");
+    }
 
-        // Dùng Virtual Threads của Java 23 cho hiệu năng tối đa
-        try (ServerSocket serverSocket = new ServerSocket(PORT);
-             var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+    private void initUI() {
+        setTitle("Zalo Chat - Server Control Panel (Java 23)");
+        setSize(920, 580);
+        setDefaultCloseOperation(EXIT_ON_CLOSE);
+        setLocationRelativeTo(null);
+        setLayout(new BorderLayout(10, 10));
 
-            while (true) {
-                Socket clientSocket = serverSocket.accept();
-                executor.submit(new ClientHandler(clientSocket));
-            }
-        } catch (IOException e) {
-            e.printStackTrace();
+        // --- THANH TRẠNG THÁI TRÊN CÙNG ---
+        JPanel headerPanel = new JPanel(new BorderLayout());
+        headerPanel.setBorder(new EmptyBorder(12, 15, 12, 15));
+
+        lblStatus.setFont(new Font("Segoe UI", Font.BOLD, 16));
+        lblStatus.setForeground(new Color(220, 53, 69)); // Đỏ
+
+        btnStartStop.setFont(new Font("Segoe UI", Font.BOLD, 14));
+        btnStartStop.setBackground(new Color(0, 122, 255)); // Blue
+        btnStartStop.setForeground(Color.WHITE);
+        btnStartStop.addActionListener(e -> toggleServer());
+
+        headerPanel.add(lblStatus, BorderLayout.WEST);
+        headerPanel.add(btnStartStop, BorderLayout.EAST);
+        add(headerPanel, BorderLayout.NORTH);
+
+        // --- NỘI DUNG CHÍNH (LOG & DANH SÁCH CLIENT) ---
+        JPanel centerPanel = new JPanel(new BorderLayout(10, 10));
+        centerPanel.setBorder(new EmptyBorder(0, 15, 15, 15));
+
+        // Nhật ký Server (Bên trái)
+        txtLog.setEditable(false);
+        txtLog.setFont(new Font("Consolas", Font.PLAIN, 13));
+        JScrollPane logScroll = new JScrollPane(txtLog);
+        logScroll.setBorder(BorderFactory.createTitledBorder("Nhật ký Server (Activity Log)"));
+
+        // Danh sách Client & Nút Kick (Bên phải)
+        JPanel rightPanel = new JPanel(new BorderLayout(8, 8));
+        rightPanel.setPreferredSize(new Dimension(260, 0));
+        rightPanel.setBorder(BorderFactory.createTitledBorder("Client Đang Kết Nối"));
+
+        lstClients.setFont(new Font("Segoe UI", Font.PLAIN, 14));
+        lstClients.setFixedCellHeight(38);
+        rightPanel.add(new JScrollPane(lstClients), BorderLayout.CENTER);
+
+        btnKick.setBackground(new Color(220, 53, 69)); // Red button
+        btnKick.setForeground(Color.WHITE);
+        btnKick.setFont(new Font("Segoe UI", Font.BOLD, 13));
+        btnKick.addActionListener(e -> kickSelectedClient());
+        rightPanel.add(btnKick, BorderLayout.SOUTH);
+
+        centerPanel.add(logScroll, BorderLayout.CENTER);
+        centerPanel.add(rightPanel, BorderLayout.EAST);
+
+        add(centerPanel, BorderLayout.CENTER);
+    }
+
+    private synchronized void toggleServer() {
+        if (!isRunning) {
+            startServer();
+        } else {
+            stopServer();
         }
     }
 
-    static class ClientHandler implements Runnable {
+    private void startServer() {
+        try {
+            serverSocket = new ServerSocket(PORT);
+            executor = Executors.newVirtualThreadPerTaskExecutor(); // Virtual Threads Java 23
+            isRunning = true;
+
+            lblStatus.setText("Trạng thái: Đang chạy trên Port " + PORT);
+            lblStatus.setForeground(new Color(40, 167, 69)); // Xanh lá
+            btnStartStop.setText("Dừng Server");
+            btnStartStop.setBackground(new Color(220, 53, 69));
+
+            log("[SERVER] Đã khởi tạo và lắng nghe kết nối thành công trên Port " + PORT);
+
+            // Thread riêng lắng nghe các Client kết nối
+            executor.submit(() -> {
+                while (isRunning && !serverSocket.isClosed()) {
+                    try {
+                        Socket clientSocket = serverSocket.accept();
+                        executor.submit(new ClientHandler(clientSocket));
+                    } catch (IOException e) {
+                        if (!isRunning) break;
+                    }
+                }
+            });
+
+        } catch (IOException e) {
+            log("[ERR] Lỗi khi khởi động Server: " + e.getMessage());
+        }
+    }
+
+    private void stopServer() {
+        isRunning = false;
+        try {
+            // Ngắt kết nối tất cả Client đang Online
+            for (ClientHandler handler : onlineUsers.values()) {
+                handler.closeConnection();
+            }
+            onlineUsers.clear();
+            updateClientListUI();
+
+            if (serverSocket != null && !serverSocket.isClosed()) {
+                serverSocket.close();
+            }
+            if (executor != null) {
+                executor.shutdownNow();
+            }
+
+            lblStatus.setText("Trạng thái: Đã dừng");
+            lblStatus.setForeground(new Color(220, 53, 69));
+            btnStartStop.setText("Khởi động Server");
+            btnStartStop.setBackground(new Color(0, 122, 255));
+
+            log("[SERVER] Server đã dừng hoạt động.");
+        } catch (IOException e) {
+            log("[ERR] Lỗi dừng Server: " + e.getMessage());
+        }
+    }
+
+    private void kickSelectedClient() {
+        String selectedUser = lstClients.getSelectedValue();
+        if (selectedUser == null) {
+            JOptionPane.showMessageDialog(this, "Vui lòng chọn một client từ danh sách để Kick!");
+            return;
+        }
+
+        int confirm = JOptionPane.showConfirmDialog(this,
+                "Bạn có chắc chắn muốn kick client [" + selectedUser + "] khỏi máy chủ?",
+                "Xác nhận Kick",
+                JOptionPane.YES_NO_OPTION);
+
+        if (confirm == JOptionPane.YES_OPTION) {
+            ClientHandler handler = onlineUsers.get(selectedUser);
+            if (handler != null) {
+                handler.kick();
+                log("[KICK] Admin đã kick client: " + selectedUser);
+            }
+        }
+    }
+
+    private void log(String message) {
+        SwingUtilities.invokeLater(() -> {
+            txtLog.append(message + "\n");
+            txtLog.setCaretPosition(txtLog.getDocument().getLength());
+        });
+    }
+
+    private void updateClientListUI() {
+        SwingUtilities.invokeLater(() -> {
+            clientListModel.clear();
+            onlineUsers.keySet().forEach(clientListModel::addElement);
+        });
+    }
+
+    // Class xử lý kết nối từng Client
+    class ClientHandler implements Runnable {
         private final Socket socket;
         private DataInputStream dis;
         private DataOutputStream dos;
@@ -44,14 +205,15 @@ public class ChatServer {
                 dis = new DataInputStream(socket.getInputStream());
                 dos = new DataOutputStream(socket.getOutputStream());
 
-                username = dis.readUTF(); // Client gửi username khi kết nối
+                username = dis.readUTF(); // Đọc username đăng nhập
                 onlineUsers.put(username, this);
                 updateUserStatusInDB(username, "ONLINE");
+
+                log("[+] Client kết nối thành công: " + username + " (" + socket.getInetAddress().getHostAddress() + ")");
+                updateClientListUI();
                 broadcastUserList();
 
-                System.out.println("[+] " + username + " đã kết nối.");
-
-                while (true) {
+                while (isRunning) {
                     String command = dis.readUTF();
                     switch (command) {
                         case "TEXT" -> {
@@ -59,11 +221,13 @@ public class ChatServer {
                             String msg = dis.readUTF();
                             saveMessageToDB(username, target, "TEXT", msg);
                             sendPrivateMessage(target, "TEXT", username, msg);
+                            log("[MSG] " + username + " -> " + target + ": " + msg);
                         }
                         case "BROADCAST" -> {
                             String msg = dis.readUTF();
                             saveMessageToDB(username, "ALL", "TEXT", msg);
                             broadcastMessage(username, msg);
+                            log("[BROADCAST] " + username + ": " + msg);
                         }
                         case "FILE" -> {
                             String target = dis.readUTF();
@@ -85,17 +249,41 @@ public class ChatServer {
                             }
                             saveMessageToDB(username, target, "FILE", fileName);
                             sendPrivateMessage(target, "FILE", username, fileName);
+                            log("[FILE] " + username + " -> " + target + ": " + fileName);
                         }
                     }
                 }
             } catch (IOException e) {
-                System.out.println("[-] " + username + " ngắt kết nối.");
-            } finally {
                 if (username != null) {
-                    onlineUsers.remove(username);
-                    updateUserStatusInDB(username, "OFFLINE");
-                    broadcastUserList();
+                    log("[-] Client ngắt kết nối: " + username);
                 }
+            } finally {
+                closeConnection();
+            }
+        }
+
+        public void kick() {
+            try {
+                if (dos != null) {
+                    dos.writeUTF("KICKED");
+                    dos.writeUTF("Bạn đã bị Server ngắt kết nối (Kicked)!");
+                }
+            } catch (IOException ignored) {}
+            closeConnection();
+        }
+
+        public void closeConnection() {
+            try {
+                if (socket != null && !socket.isClosed()) {
+                    socket.close();
+                }
+            } catch (IOException ignored) {}
+
+            if (username != null && onlineUsers.containsKey(username)) {
+                onlineUsers.remove(username);
+                updateUserStatusInDB(username, "OFFLINE");
+                updateClientListUI();
+                broadcastUserList();
             }
         }
 
@@ -137,7 +325,7 @@ public class ChatServer {
                 pstmt.setString(4, content);
                 pstmt.executeUpdate();
             } catch (SQLException e) {
-                e.printStackTrace();
+                log("[DB ERR] " + e.getMessage());
             }
         }
 
@@ -148,8 +336,13 @@ public class ChatServer {
                 pstmt.setString(2, username);
                 pstmt.executeUpdate();
             } catch (SQLException e) {
-                e.printStackTrace();
+                log("[DB ERR] " + e.getMessage());
             }
         }
+    }
+
+    public static void main(String[] args) {
+        FlatDarkLaf.setup();
+        SwingUtilities.invokeLater(() -> new ChatServer().setVisible(true));
     }
 }
